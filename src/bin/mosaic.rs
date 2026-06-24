@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use std::{
     env,
     fs::{self, OpenOptions},
-    io::{self, Write},
+    io::{self, BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Command, ExitCode},
     str::FromStr,
@@ -80,6 +80,16 @@ enum MosaicCommand {
         #[clap(subcommand)]
         command: PromptCommand,
     },
+    /// Inspect and clear queued prompts.
+    Queue {
+        #[clap(subcommand)]
+        command: QueueCommand,
+    },
+    /// Inspect local audit records.
+    Audit {
+        #[clap(subcommand)]
+        command: AuditCommand,
+    },
     /// Capture pane output.
     Capture(CaptureArgs),
     /// Subscribe to pane output.
@@ -155,6 +165,53 @@ enum TabCommand {
 enum PromptCommand {
     /// Send a prompt now, or enqueue it for later delivery.
     Send(PromptSendArgs),
+}
+
+#[derive(Subcommand, Debug)]
+enum QueueCommand {
+    /// List queued prompts from local Mosaic state.
+    List(QueueListArgs),
+    /// Clear queued prompts from local Mosaic state.
+    Clear(QueueClearArgs),
+}
+
+#[derive(Parser, Debug)]
+struct QueueListArgs {
+    /// Optional pane ID filter.
+    #[clap(long)]
+    pane_id: Option<String>,
+    /// Maximum records to return, newest records kept.
+    #[clap(long)]
+    limit: Option<usize>,
+    /// Redact prompt bodies in returned queue records.
+    #[clap(long)]
+    redact: bool,
+}
+
+#[derive(Parser, Debug)]
+struct QueueClearArgs {
+    /// Target pane ID.
+    #[clap(long)]
+    pane_id: String,
+    /// Clear only one queued prompt receipt ID. Omit to clear the pane queue.
+    #[clap(long)]
+    receipt_id: Option<String>,
+}
+
+#[derive(Subcommand, Debug)]
+enum AuditCommand {
+    /// List local audit records.
+    List(AuditListArgs),
+}
+
+#[derive(Parser, Debug)]
+struct AuditListArgs {
+    /// Maximum records to return, newest records kept.
+    #[clap(long)]
+    limit: Option<usize>,
+    /// Redact prompt bodies if present in future audit records.
+    #[clap(long)]
+    redact: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -378,6 +435,8 @@ fn run(cli: MosaicCli) -> Result<u8, MosaicError> {
                 PromptCommand::Send(args) => run_prompt_send(&session, args, cli.dry_run),
             }
         },
+        MosaicCommand::Queue { command } => run_queue(command, cli.session, cli.dry_run),
+        MosaicCommand::Audit { command } => run_audit(command),
         MosaicCommand::Capture(args) => {
             let session = resolve_session(cli.session)?;
             let output = dispatch_cli_action_capture(
@@ -397,6 +456,83 @@ fn run(cli: MosaicCli) -> Result<u8, MosaicError> {
         MosaicCommand::Subscribe(args) => {
             let session = resolve_session(cli.session)?;
             run_subscribe(&session, args)
+        },
+    }
+}
+
+fn run_queue(
+    command: QueueCommand,
+    session: Option<String>,
+    dry_run: bool,
+) -> Result<u8, MosaicError> {
+    match command {
+        QueueCommand::List(args) => {
+            if let Some(pane_id) = args.pane_id.as_deref() {
+                validate_pane_id(pane_id)?;
+            }
+            let mut records = read_queue_records(session.as_deref(), args.pane_id.as_deref())?;
+            sort_values_by_timestamp(&mut records);
+            if args.redact {
+                redact_prompts(&mut records);
+            }
+            records = last_n_values(records, args.limit);
+            print_value(json!({
+                "schema_version": SCHEMA_VERSION,
+                "event": "queue.list",
+                "session": session,
+                "pane_id": args.pane_id,
+                "timestamp_ms": now_millis(),
+                "data": records,
+            }))?;
+            Ok(0)
+        },
+        QueueCommand::Clear(args) => {
+            validate_pane_id(&args.pane_id)?;
+            let session = session.ok_or_else(|| {
+                MosaicError::new(
+                    "queue_session_required",
+                    "pass --session when clearing a queue",
+                )
+            })?;
+            if dry_run {
+                print_receipt(
+                    "queue.clear",
+                    Some(&session),
+                    Some(&args.pane_id),
+                    "dry_run",
+                    None,
+                )?;
+                return Ok(0);
+            }
+            clear_queue_records(&session, &args.pane_id, args.receipt_id.as_deref())?;
+            print_local_state_receipt(
+                "queue.clear",
+                Some(&session),
+                Some(&args.pane_id),
+                "accepted",
+                None,
+            )?;
+            Ok(0)
+        },
+    }
+}
+
+fn run_audit(command: AuditCommand) -> Result<u8, MosaicError> {
+    match command {
+        AuditCommand::List(args) => {
+            let mut records = read_ndjson_file(&audit_path())?;
+            sort_values_by_timestamp(&mut records);
+            if args.redact {
+                redact_prompts(&mut records);
+            }
+            records = last_n_values(records, args.limit);
+            print_value(json!({
+                "schema_version": SCHEMA_VERSION,
+                "event": "audit.list",
+                "timestamp_ms": now_millis(),
+                "data": records,
+            }))?;
+            Ok(0)
         },
     }
 }
@@ -889,6 +1025,21 @@ fn print_receipt(
     Ok(())
 }
 
+fn print_local_state_receipt(
+    operation: &str,
+    session: Option<&str>,
+    pane_id: Option<&str>,
+    status: &str,
+    error: Option<String>,
+) -> Result<(), MosaicError> {
+    let mut receipt = receipt(operation, session, pane_id, status, error);
+    if status == "accepted" {
+        receipt["ack"] = json!("local_state_updated");
+    }
+    audit(&receipt);
+    print_value(receipt)
+}
+
 fn receipt(
     operation: &str,
     session: Option<&str>,
@@ -970,23 +1121,398 @@ fn enqueue_prompt(
     } else {
         json!(prompt)
     };
-    append_json_line(
-        &path,
-        &json!({
-            "schema_version": SCHEMA_VERSION,
-            "event": "queued_prompt",
-            "receipt": receipt,
-            "prompt": prompt_value,
-        }),
-    )
+    with_state_file_lock(&queue_lock_path(&path), || {
+        append_json_line(
+            &path,
+            &json!({
+                "schema_version": SCHEMA_VERSION,
+                "event": "queued_prompt",
+                "session": session,
+                "pane_id": pane_id,
+                "timestamp_ms": now_millis(),
+                "receipt": receipt,
+                "prompt": prompt_value,
+            }),
+        )
+    })
 }
 
 fn audit(record: &Value) {
-    let path = mosaic_state_dir().join("audit.ndjson");
+    let path = audit_path();
     if let Some(parent) = path.parent() {
         let _ = create_private_dir(parent);
     }
     let _ = append_json_line(&path, record);
+}
+
+fn audit_path() -> PathBuf {
+    mosaic_state_dir().join("audit.ndjson")
+}
+
+fn queue_file_path(session: &str, pane_id: &str) -> Result<PathBuf, MosaicError> {
+    let session_component = safe_path_component(session, "session")?;
+    Ok(mosaic_state_dir()
+        .join("queues")
+        .join(session_component)
+        .join(format!("{}.ndjson", sanitize_filename(pane_id))))
+}
+
+fn read_queue_records(
+    session: Option<&str>,
+    pane_id: Option<&str>,
+) -> Result<Vec<Value>, MosaicError> {
+    match (session, pane_id) {
+        (Some(session), Some(pane_id)) => read_ndjson_file(&queue_file_path(session, pane_id)?),
+        (Some(session), None) => {
+            let session_component = safe_path_component(session, "session")?;
+            let dir = mosaic_state_dir().join("queues").join(session_component);
+            read_ndjson_files_in_dir(&dir)
+        },
+        (None, Some(pane_id)) => {
+            let root = mosaic_state_dir().join("queues");
+            let mut records = Vec::new();
+            for session_dir in read_child_dirs(&root)? {
+                records.extend(read_ndjson_file(
+                    &session_dir.join(format!("{}.ndjson", sanitize_filename(pane_id))),
+                )?);
+            }
+            Ok(records)
+        },
+        (None, None) => {
+            let root = mosaic_state_dir().join("queues");
+            let mut records = Vec::new();
+            for session_dir in read_child_dirs(&root)? {
+                records.extend(read_ndjson_files_in_dir(&session_dir)?);
+            }
+            Ok(records)
+        },
+    }
+}
+
+fn clear_queue_records(
+    session: &str,
+    pane_id: &str,
+    receipt_id: Option<&str>,
+) -> Result<(), MosaicError> {
+    let path = queue_file_path(session, pane_id)?;
+    with_state_file_lock(&queue_lock_path(&path), || {
+        clear_queue_records_locked(&path, receipt_id)
+    })
+}
+
+fn clear_queue_records_locked(path: &Path, receipt_id: Option<&str>) -> Result<(), MosaicError> {
+    if receipt_id.is_none() {
+        match fs::remove_file(&path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(MosaicError::new(
+                    "state_write_failed",
+                    format!("failed to remove {}: {error}", path.display()),
+                ));
+            },
+        }
+    }
+
+    let receipt_id = receipt_id.unwrap();
+    let records = read_ndjson_file(&path)?;
+    let original_len = records.len();
+    let retained = records
+        .into_iter()
+        .filter(|record| {
+            record
+                .get("receipt")
+                .and_then(|receipt| receipt.get("id"))
+                .and_then(Value::as_str)
+                != Some(receipt_id)
+        })
+        .collect::<Vec<_>>();
+    if retained.len() == original_len {
+        return Err(MosaicError::new(
+            "queue_record_not_found",
+            format!("queued prompt receipt {receipt_id:?} not found"),
+        ));
+    }
+    if retained.is_empty() {
+        fs::remove_file(&path).map_err(|e| {
+            MosaicError::new(
+                "state_write_failed",
+                format!("failed to remove {}: {e}", path.display()),
+            )
+        })?;
+        return Ok(());
+    }
+    write_ndjson_file(&path, &retained)
+}
+
+fn queue_lock_path(path: &Path) -> PathBuf {
+    path.with_extension("ndjson.lock")
+}
+
+struct StateFileLock {
+    path: PathBuf,
+}
+
+impl Drop for StateFileLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn with_state_file_lock<T>(
+    lock_path: &Path,
+    operation: impl FnOnce() -> Result<T, MosaicError>,
+) -> Result<T, MosaicError> {
+    let _lock = acquire_state_file_lock(lock_path)?;
+    operation()
+}
+
+fn acquire_state_file_lock(lock_path: &Path) -> Result<StateFileLock, MosaicError> {
+    if let Some(parent) = lock_path.parent() {
+        create_private_dir(parent)?;
+    }
+    for _ in 0..500 {
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(lock_path) {
+            Ok(_) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(lock_path, fs::Permissions::from_mode(0o600)).map_err(
+                        |e| {
+                            MosaicError::new(
+                                "state_write_failed",
+                                format!(
+                                    "failed to set permissions on {}: {e}",
+                                    lock_path.display()
+                                ),
+                            )
+                        },
+                    )?;
+                }
+                return Ok(StateFileLock {
+                    path: lock_path.to_path_buf(),
+                });
+            },
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                thread::sleep(Duration::from_millis(10));
+            },
+            Err(error) => {
+                return Err(MosaicError::new(
+                    "state_write_failed",
+                    format!("failed to lock {}: {error}", lock_path.display()),
+                ));
+            },
+        }
+    }
+    Err(MosaicError::new(
+        "state_lock_timeout",
+        format!("timed out waiting for {}", lock_path.display()),
+    ))
+}
+
+fn read_ndjson_files_in_dir(dir: &Path) -> Result<Vec<Value>, MosaicError> {
+    let mut records = Vec::new();
+    for path in read_child_files(dir)? {
+        if path.extension().and_then(|ext| ext.to_str()) == Some("ndjson") {
+            records.extend(read_ndjson_file(&path)?);
+        }
+    }
+    Ok(records)
+}
+
+fn read_child_dirs(root: &Path) -> Result<Vec<PathBuf>, MosaicError> {
+    read_dir_entries(root, true)
+}
+
+fn read_child_files(root: &Path) -> Result<Vec<PathBuf>, MosaicError> {
+    read_dir_entries(root, false)
+}
+
+fn read_dir_entries(root: &Path, dirs: bool) -> Result<Vec<PathBuf>, MosaicError> {
+    let mut entries = Vec::new();
+    match fs::read_dir(root) {
+        Ok(read_dir) => {
+            for entry in read_dir {
+                let entry = entry.map_err(|e| {
+                    MosaicError::new(
+                        "state_read_failed",
+                        format!("failed to read {}: {e}", root.display()),
+                    )
+                })?;
+                let file_type = entry.file_type().map_err(|e| {
+                    MosaicError::new(
+                        "state_read_failed",
+                        format!("failed to stat {}: {e}", entry.path().display()),
+                    )
+                })?;
+                if file_type.is_dir() == dirs {
+                    entries.push(entry.path());
+                }
+            }
+            entries.sort();
+            Ok(entries)
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(entries),
+        Err(error) => Err(MosaicError::new(
+            "state_read_failed",
+            format!("failed to read {}: {error}", root.display()),
+        )),
+    }
+}
+
+fn read_ndjson_file(path: &Path) -> Result<Vec<Value>, MosaicError> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(MosaicError::new(
+                "state_read_failed",
+                format!("failed to open {}: {error}", path.display()),
+            ));
+        },
+    };
+    let reader = BufReader::new(file);
+    let mut records = Vec::new();
+    for (index, line) in reader.lines().enumerate() {
+        let line = line.map_err(|e| {
+            MosaicError::new(
+                "state_read_failed",
+                format!("failed to read {}: {e}", path.display()),
+            )
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value = serde_json::from_str(&line).map_err(|e| {
+            MosaicError::new(
+                "invalid_state_json",
+                format!("{}:{}: {e}", path.display(), index + 1),
+            )
+        })?;
+        records.push(value);
+    }
+    Ok(records)
+}
+
+fn write_ndjson_file(path: &Path, records: &[Value]) -> Result<(), MosaicError> {
+    if let Some(parent) = path.parent() {
+        create_private_dir(parent)?;
+    }
+    let temp_path = ndjson_temp_path(path);
+    {
+        let mut options = OpenOptions::new();
+        options.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp_path).map_err(|e| {
+            MosaicError::new(
+                "state_write_failed",
+                format!("failed to open {}: {e}", temp_path.display()),
+            )
+        })?;
+        for record in records {
+            writeln!(file, "{record}").map_err(|e| {
+                MosaicError::new(
+                    "state_write_failed",
+                    format!("failed to write {}: {e}", temp_path.display()),
+                )
+            })?;
+        }
+    }
+    fs::rename(&temp_path, path).map_err(|e| {
+        MosaicError::new(
+            "state_write_failed",
+            format!(
+                "failed to replace {} with {}: {e}",
+                path.display(),
+                temp_path.display()
+            ),
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|e| {
+            MosaicError::new(
+                "state_write_failed",
+                format!("failed to set permissions on {}: {e}", path.display()),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn ndjson_temp_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("state.ndjson");
+    path.with_file_name(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        now_millis()
+    ))
+}
+
+fn last_n_values(mut records: Vec<Value>, limit: Option<usize>) -> Vec<Value> {
+    if let Some(limit) = limit {
+        if records.len() > limit {
+            records = records.split_off(records.len() - limit);
+        }
+    }
+    records
+}
+
+fn sort_values_by_timestamp(records: &mut [Value]) {
+    records.sort_by_key(record_timestamp_ms);
+}
+
+fn record_timestamp_ms(record: &Value) -> u64 {
+    record
+        .get("timestamp_ms")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            record
+                .get("receipt")
+                .and_then(|receipt| receipt.get("timestamp_ms"))
+                .and_then(Value::as_u64)
+        })
+        .unwrap_or(0)
+}
+
+fn redact_prompts(records: &mut [Value]) {
+    for record in records {
+        redact_prompt_value(record);
+    }
+}
+
+fn redact_prompt_value(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            if object.contains_key("prompt") {
+                object.insert("prompt".to_owned(), json!("[redacted]"));
+            }
+            for value in object.values_mut() {
+                redact_prompt_value(value);
+            }
+        },
+        Value::Array(values) => {
+            for value in values {
+                redact_prompt_value(value);
+            }
+        },
+        _ => {},
+    }
 }
 
 fn append_json_line(path: &Path, record: &Value) -> Result<(), MosaicError> {
@@ -1030,15 +1556,30 @@ fn create_private_dir(path: &Path) -> Result<(), MosaicError> {
     })?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|e| {
-            MosaicError::new(
-                "state_write_failed",
-                format!("failed to set permissions on {}: {e}", path.display()),
-            )
-        })?;
+        let state_root = mosaic_state_dir();
+        if let Ok(relative) = path.strip_prefix(&state_root) {
+            set_private_dir_permissions(&state_root)?;
+            let mut current = state_root;
+            for component in relative.components() {
+                current.push(component.as_os_str());
+                set_private_dir_permissions(&current)?;
+            }
+        } else {
+            set_private_dir_permissions(path)?;
+        }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_dir_permissions(path: &Path) -> Result<(), MosaicError> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|e| {
+        MosaicError::new(
+            "state_write_failed",
+            format!("failed to set permissions on {}: {e}", path.display()),
+        )
+    })
 }
 
 fn safe_path_component(value: &str, field: &'static str) -> Result<String, MosaicError> {

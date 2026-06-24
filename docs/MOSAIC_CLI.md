@@ -80,6 +80,8 @@ mosaic --session work prompt send --pane-id terminal_1 --text "cargo test"
 mosaic --session work prompt send --pane-id terminal_1 --file prompt.txt --no-submit
 mosaic --session work --dry-run prompt send --pane-id terminal_1 --text "status?"
 mosaic --session work prompt send --pane-id terminal_1 --queue --text "next task"
+mosaic --session work queue list --pane-id terminal_1 --redact
+mosaic --session work queue clear --pane-id terminal_1 --receipt-id mosaic-123
 ```
 
 Receipts use this shape:
@@ -99,14 +101,36 @@ Receipts use this shape:
 }
 ```
 
-`accepted` means the server accepted the write/paste/key action. It does not
-mean the terminal process consumed the bytes or completed work. Use capture or
-subscribe to observe results.
+For operations that touch the terminal server, `status: "accepted"` with
+`ack: "server_accepted"` means the server accepted the write/paste/key action.
+It does not mean the terminal process consumed the bytes or completed work. Use
+capture or subscribe to observe results. Local state operations such as
+`queue clear` use `ack: "local_state_updated"` when the queue file mutation
+has completed.
 
 Queued prompts are stored as NDJSON under `$XDG_STATE_HOME/open-mosaic/queues`
 or `~/.local/state/open-mosaic/queues`. Audit records are appended to
 `audit.ndjson` in the same state directory. Set `MOSAIC_AUDIT_REDACT=1` to
 redact queued prompt bodies from local queue records.
+
+`queue list` returns a `queue.list` envelope with local queued prompt records in
+the `data` array, ordered by `timestamp_ms` before `--limit` keeps the newest
+records. Omit `--session` to inspect all local queue files, or pass `--pane-id`
+to filter. `--redact` replaces prompt bodies with `[redacted]` in the command
+output without modifying the queue file. `queue clear` requires `--session` and
+`--pane-id`; it removes either the whole pane queue or one record selected by
+`--receipt-id`. Queue appends and clears are serialized per queue file so a
+receipt-specific clear cannot discard unrelated queued prompts. Top-level
+`--dry-run` emits a `queue.clear` receipt without mutating the queue.
+
+```sh
+mosaic audit list --limit 20
+mosaic audit list --redact
+```
+
+`audit list` returns an `audit.list` envelope with local audit records. Audit
+records are local observer data; consumers should treat them as append-only
+evidence, not as proof that a terminal process consumed a prompt.
 
 ## Observation
 
