@@ -399,7 +399,7 @@
         { "$ref": "#/$defs/controlEnvelope" },
         {
           "type": "object",
-          "required": ["event", "timestamp_ms", "partial", "errors", "state_scope", "sessions", "queues", "audit", "goals", "live"],
+          "required": ["event", "timestamp_ms", "partial", "errors", "state_scope", "sessions", "queues", "audit", "goals", "project", "live"],
           "properties": {
             "event": { "const": "dashboard.snapshot" },
             "timestamp_ms": { "$ref": "#/$defs/timestampMs" },
@@ -414,6 +414,7 @@
             "queues": { "type": "object", "additionalProperties": true },
             "audit": { "type": "object", "additionalProperties": true },
             "goals": { "type": "object", "additionalProperties": true },
+            "project": { "type": "object", "additionalProperties": true },
             "live": { "type": "object", "additionalProperties": true }
           }
         }

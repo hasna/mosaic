@@ -273,26 +273,39 @@ mosaic dashboard --format text
 mosaic --session work dashboard
 mosaic --session work dashboard --live --redact
 mosaic dashboard --goals-file goals.json --redact
+mosaic dashboard --project-dir /work/repo --github-pr --redact
 ```
 
 `dashboard` returns a `dashboard.snapshot` envelope that combines local Mosaic
 state into one compact view for agents, scripts, and terminal dashboard panes.
 It does not require private services. Without `--live`, it only reads local
-user state and the session list: pending queues, recent audit records, optional
-goals/tasks, and running session names. With `--live`, it also asks the target
-Mosaic/Zellij session for panes and tabs, enriches panes with `mosaic_agent`
-metadata, and summarizes agent kinds without returning full raw pane dumps.
+user state, local Git project context, and the session list: pending queues,
+recent audit records, optional goals/tasks, the current branch/worktree status,
+and running session names. With `--live`, it also asks the target Mosaic/Zellij
+session for panes and tabs, enriches panes with `mosaic_agent` metadata, and
+summarizes agent kinds without returning full raw pane dumps.
+
+Project status is local-first and generic. By default the dashboard runs a few
+short-timeout `git` commands in the current directory; use `--project-dir` to
+watch another repository or `--no-project-status` to skip this section. It does
+not contact GitHub unless `--github-pr` is passed. With `--github-pr`, Mosaic
+uses the optional `gh` CLI to ask for the current branch's PR status and reports
+`gh_unavailable`, `not_found`, or `error` inside the `project.pull_request`
+section instead of failing the dashboard command. Set `MOSAIC_GIT_BIN` or
+`MOSAIC_GH_BIN` to point at alternate binaries.
 
 Queued prompt bodies are redacted by default in dashboard JSON and text output.
 Pass `--show-prompts` only when the caller is allowed to view queued prompt
 content. `--redact` forces prompt-body redaction and redacts live pane titles,
-current task text, goals/task text, local paths, and command details from live
-agent summaries. When one section cannot be read, for example live panes, a
-configured goals registry, local queues, or the audit log, the command still
-returns the remaining snapshot with `partial: true`, an `errors` array, and a
-section-specific status such as `live.status: "error"` or
-`goals.status: "error"`. The text format is intended for a compact terminal
-pane and sanitizes control characters from dynamic labels:
+current task text, goals/task text, local paths, project paths, PR titles/URLs,
+and command details from live agent summaries. When one section cannot be read,
+for example live panes, a configured goals registry, local queues, project Git
+state, or the audit log, the command still returns the remaining snapshot with
+`partial: true`, an `errors` array, and a section-specific status such as
+`live.status: "error"` or `goals.status: "error"`. Missing GitHub CLI,
+non-Git directories, or absent PRs are represented as project statuses and do
+not make the snapshot partial. The text format is intended for a compact
+terminal pane and sanitizes control characters from dynamic labels:
 
 ```text
 Open Mosaic Dashboard
@@ -300,6 +313,9 @@ Sessions: 1 running
 Queues: 2 pending (redacted)
 Audit: 6 records
 Goals: 1 goals, 3 tasks (loaded)
+Project: captured
+  Branch: main  Dirty: false
+  PR: not_requested
 Live: not_requested
 Agent Metadata: 0 panes
 ```
