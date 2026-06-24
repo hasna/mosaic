@@ -4,7 +4,18 @@ build = "src/build.rs"
 authors = ["Aram Drevekenin <aram@poor.dev>"]
 description = "A terminal workspace with batteries included"
 homepage = "https://zellij.dev"
-include = ["src/**/*", "assets/layouts/*", "assets/config/*", "LICENSE.md", "README.md", "!**/*_test.*", "!**/tests/**/*"]
+include = [
+  "src/**/*",
+  "assets/layouts/*",
+  "assets/config/*",
+  "LICENSE.md",
+  "NOTICE.md",
+  "README.md",
+  "docs/MOSAIC_CLI.md",
+  "docs/OPEN_MOSAIC.md",
+  "!**/*_test.*",
+  "!**/tests/**/*"
+]
 # See 'workspace.package' for concrete values
 license.workspace = true
 repository.workspace = true
@@ -29,6 +40,7 @@ names = { workspace = true }
 suggest = { workspace = true }
 thiserror = { workspace = true }
 isahc = { workspace = true }
+serde_json = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
@@ -41,6 +53,7 @@ insta = { version = "1.6.0", features = ["backtrace"] }
 ssh2 = "0.9.1"
 rand = "0.8.0"
 regex = "1.8.1"
+tempfile = { workspace = true }
 vte = { workspace = true }
 
 [workspace]
@@ -136,7 +149,11 @@ license-file = ["LICENSE.md", "4"]
 assets = [
   ["assets/man/zellij.1", "usr/share/man/man1/zellij.1", "644"],
   ["target/release/zellij", "usr/bin/zellij", "755"],
+  ["target/release/mosaic", "usr/bin/mosaic", "755"],
   ["GOVERNANCE.md", "usr/share/doc/zellij/GOVERNANCE.md", "644"],
+  ["NOTICE.md", "usr/share/doc/zellij/NOTICE.md", "644"],
+  ["docs/MOSAIC_CLI.md", "usr/share/doc/zellij/MOSAIC_CLI.md", "644"],
+  ["docs/OPEN_MOSAIC.md", "usr/share/doc/zellij/OPEN_MOSAIC.md", "644"],
   ["README.md", "usr/share/doc/zellij/README.md", "644"],
   ["assets/layouts/*", "usr/share/zellij/layouts/", "644"],
   ["assets/plugins/*", "usr/share/zellij/plugins/", "644"],

@@ -77,6 +77,10 @@ jobs:
             echo "RELEASE_TAG=$tag" >> $env:GITHUB_ENV
           }
 
+      - name: Enable Git long paths (Windows)
+        if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
+
       - name: Checkout repository
         uses: actions/checkout@v3
 
@@ -273,6 +277,10 @@ jobs:
             echo "RELEASE_TAG=$tag" >> $env:GITHUB_ENV
           }
 
+      - name: Enable Git long paths (Windows)
+        if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
+
       - name: Checkout repository
         uses: actions/checkout@v3
 
@@ -413,4 +421,3 @@ jobs:
           asset_path: ${{ steps.make-checksum-msi.outputs.checksum_name }}
           asset_name: zellij-no-web-${{ matrix.target }}-installer.sha256sum
           asset_content_type: text/plain
-
