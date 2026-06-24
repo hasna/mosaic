@@ -188,6 +188,35 @@ argv without executing the adapter. `--redact` hides task text and local paths
 from returned JSON. See `docs/MOSAIC_GOALS.md` for the full registry shape and
 adapter boundary.
 
+## Web Oversight
+
+```sh
+mosaic web link --session work
+mosaic web link --session work --mode watch --token-name observer
+mosaic web link --session work --mode control --base-url https://mosaic.example.test/base/
+mosaic web link --session work --redact
+```
+
+`web link` returns a `web.link` envelope using `web_schema_version:
+"mosaic.web.v1"`. It is a local helper for the existing Zellij-derived web
+client: it builds a bookmarkable `/{session}` URL, distinguishes read-only
+watcher links from control links, and documents the required token type. It
+does not start the web server, create tokens, or verify that the session
+exists.
+
+Watch mode is the default and sets `read_only_required: true`,
+`watcher: true`, and `control_allowed: false`. It is intended for read-only
+tokens created with `zellij web --create-read-only-token <name>`. Control mode
+requires a normal token created with `zellij web --create-token <name>` and
+sets `control_allowed: true`.
+
+Raw tokens are never accepted by `mosaic web link` and are never embedded in
+the URL. `--base-url` accepts only `http` and `https`; credentials, query
+strings, and fragments are rejected to avoid leaking secrets into links or
+logs. Use `--redact` when a controller should report link metadata without
+exposing session names, hostnames, route paths, or token labels. See
+`docs/MOSAIC_WEB.md` for web oversight workflows and secure deployment notes.
+
 ## Observation
 
 ```sh

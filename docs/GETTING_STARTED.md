@@ -90,6 +90,16 @@ The dashboard reads local queues and audit records without private services.
 Queued prompt bodies are redacted by default; use `--show-prompts` only when
 the caller is allowed to inspect queued prompt content.
 
+Create a read-only web oversight link for the same session:
+
+```sh
+zellij web --create-read-only-token observer
+mosaic web link --session demo --mode watch --token-name observer
+```
+
+The generated link contains no raw token. See `docs/MOSAIC_WEB.md` for the
+watch/control distinction and web-server security notes.
+
 To run the same flow against a disposable local session:
 
 ```sh

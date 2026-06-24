@@ -53,6 +53,7 @@ mosaic --session demo prompt send --pane-id 1 --text "pwd" --submit enter
 mosaic --session demo observe pane --pane-id 1 --last-lines 40
 mosaic --session demo queue list
 mosaic --session demo dashboard --live --redact
+mosaic web link --session demo --mode watch
 mosaic goals list --redact
 mosaic audit list --redact
 mosaic adapters list
@@ -64,6 +65,7 @@ Reference docs:
 - [Adapter manifests](docs/MOSAIC_ADAPTERS.md)
 - [Machines and transports](docs/MOSAIC_MACHINES.md)
 - [Goals and tasks](docs/MOSAIC_GOALS.md)
+- [Web oversight links](docs/MOSAIC_WEB.md)
 - [Migration notes from Zellij and tmux](docs/MIGRATION.md)
 - [Open Mosaic and tmux for agents](docs/TMUX_FOR_AGENTS.md)
 - [Optional dispatch integration](docs/DISPATCH_INTEGRATION.md)
