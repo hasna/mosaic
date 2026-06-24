@@ -53,6 +53,7 @@ mosaic --session demo prompt send --pane-id 1 --text "pwd" --submit enter
 mosaic --session demo observe pane --pane-id 1 --last-lines 40
 mosaic --session demo queue list
 mosaic --session demo dashboard --live --redact
+mosaic dashboard --project-dir . --github-pr --redact
 mosaic web link --session demo --mode watch
 mosaic goals list --redact
 mosaic audit list --redact

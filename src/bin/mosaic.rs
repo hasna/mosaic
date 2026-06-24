@@ -7,11 +7,11 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::{Command, ExitCode},
+    process::{Command, ExitCode, Stdio},
     str::FromStr,
     sync::mpsc,
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use zellij_client::os_input_output::{get_cli_client_os_input, ClientOsApi};
 use zellij_utils::{
@@ -512,6 +512,15 @@ struct DashboardArgs {
     /// Optional goals registry JSON file. Defaults to XDG config if present.
     #[clap(long)]
     goals_file: Option<PathBuf>,
+    /// Project directory for local Git and optional PR context. Defaults to the current directory.
+    #[clap(long)]
+    project_dir: Option<PathBuf>,
+    /// Skip local project and PR context.
+    #[clap(long)]
+    no_project_status: bool,
+    /// Optionally ask GitHub CLI for the current branch's pull request status.
+    #[clap(long)]
+    github_pr: bool,
 }
 
 #[derive(Clone, Debug, ArgEnum)]
@@ -2073,6 +2082,31 @@ fn build_dashboard_snapshot(
         },
     };
 
+    let project = if args.no_project_status {
+        json!({
+            "requested": false,
+            "status": "not_requested",
+        })
+    } else {
+        match build_project_dashboard_snapshot(
+            args.project_dir.as_deref(),
+            args.github_pr,
+            args.redact,
+        ) {
+            Ok(project) => project,
+            Err(error) => {
+                let error = dashboard_section_error("project", &error);
+                partial = true;
+                errors.push(error.clone());
+                json!({
+                    "requested": true,
+                    "status": "error",
+                    "error": error,
+                })
+            },
+        }
+    };
+
     let live = if args.live {
         match resolve_session(requested_session.clone())
             .and_then(|session| build_live_dashboard_snapshot(&session, args.redact))
@@ -2120,6 +2154,7 @@ fn build_dashboard_snapshot(
         "queues": queue_summary,
         "audit": audit_summary,
         "goals": goals,
+        "project": project,
         "live": live,
     }))
 }
@@ -2138,6 +2173,277 @@ fn redact_dashboard_source(source: &mut Value) {
             object.insert("path".to_owned(), json!("[redacted]"));
         }
     }
+}
+
+fn build_project_dashboard_snapshot(
+    requested_path: Option<&Path>,
+    github_pr: bool,
+    redact: bool,
+) -> Result<Value, MosaicError> {
+    let project_dir = match requested_path {
+        Some(path) => path.to_path_buf(),
+        None => {
+            env::current_dir().map_err(|e| MosaicError::new("project_dir_failed", e.to_string()))?
+        },
+    };
+    let project_path = redact_string(project_dir.display().to_string(), redact);
+    let root_output = match run_git_command(&project_dir, &["rev-parse", "--show-toplevel"]) {
+        Ok(output) => output,
+        Err(error) if error.code == "git_unavailable" => {
+            return Ok(json!({
+                "requested": true,
+                "status": "git_unavailable",
+                "path": project_path,
+                "git": {
+                    "available": false,
+                },
+                "pull_request": github_pr_unavailable("not_applicable", "git is unavailable", redact),
+            }));
+        },
+        Err(error) => return Err(error),
+    };
+
+    if !root_output.status.success() {
+        let stderr = output_stderr(&root_output);
+        let status = if stderr.to_ascii_lowercase().contains("not a git repository") {
+            "not_git_repo"
+        } else {
+            "git_error"
+        };
+        return Ok(json!({
+            "requested": true,
+            "status": status,
+            "path": project_path,
+            "git": {
+                "available": true,
+                "exit_code": root_output.status.code(),
+                "message": dashboard_text_cell(&stderr),
+            },
+            "pull_request": github_pr_unavailable("not_applicable", "project is not a Git repository", redact),
+        }));
+    }
+
+    let repo_root = output_stdout_trimmed(&root_output);
+    let branch = optional_git_stdout(&project_dir, &["branch", "--show-current"])?;
+    let head = optional_git_stdout(&project_dir, &["rev-parse", "--short", "HEAD"])?;
+    let upstream = optional_git_stdout(
+        &project_dir,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )?;
+    let dirty = optional_git_stdout(&project_dir, &["status", "--porcelain=v1"])?
+        .map(|status| !status.is_empty())
+        .unwrap_or(false);
+    let (ahead, behind) = if upstream.is_some() {
+        ahead_behind_counts(&project_dir)?
+    } else {
+        (Value::Null, Value::Null)
+    };
+    let pull_request = if github_pr {
+        build_github_pr_status(&project_dir, redact)
+    } else {
+        json!({
+            "provider": "github",
+            "status": "not_requested",
+            "command": "mosaic dashboard --github-pr",
+        })
+    };
+
+    Ok(json!({
+        "requested": true,
+        "status": "captured",
+        "path": project_path,
+        "git": {
+            "available": true,
+            "repo_root": redact_string(repo_root, redact),
+            "branch": branch,
+            "head": head,
+            "dirty": dirty,
+            "upstream": upstream,
+            "ahead": ahead,
+            "behind": behind,
+        },
+        "pull_request": pull_request,
+    }))
+}
+
+fn build_github_pr_status(project_dir: &Path, redact: bool) -> Value {
+    let output = match run_gh_command(
+        project_dir,
+        &[
+            "pr",
+            "view",
+            "--json",
+            "number,title,state,url,mergeStateStatus,reviewDecision,isDraft,headRefName,baseRefName",
+        ],
+    ) {
+        Ok(output) => output,
+        Err(error) if error.code == "gh_unavailable" => {
+            return github_pr_unavailable("gh_unavailable", &error.message, redact);
+        },
+        Err(error) => {
+            return json!({
+                "provider": "github",
+                "status": "error",
+                "code": error.code,
+                "message": dashboard_error_message(&error.message, redact),
+            });
+        },
+    };
+    if !output.status.success() {
+        let stderr = output_stderr(&output);
+        let status = if stderr.to_ascii_lowercase().contains("no pull request")
+            || stderr.to_ascii_lowercase().contains("could not find")
+        {
+            "not_found"
+        } else {
+            "error"
+        };
+        return json!({
+            "provider": "github",
+            "status": status,
+            "exit_code": output.status.code(),
+            "message": dashboard_error_message(&stderr, redact),
+        });
+    }
+    match serde_json::from_str::<Value>(&output_stdout_trimmed(&output)) {
+        Ok(mut pr) => {
+            if redact {
+                if let Value::Object(object) = &mut pr {
+                    if object.contains_key("title") {
+                        object.insert("title".to_owned(), json!("[redacted]"));
+                    }
+                    if object.contains_key("url") {
+                        object.insert("url".to_owned(), json!("[redacted]"));
+                    }
+                }
+            }
+            json!({
+                "provider": "github",
+                "status": "captured",
+                "data": pr,
+            })
+        },
+        Err(error) => json!({
+            "provider": "github",
+            "status": "invalid_gh_json",
+            "message": dashboard_error_message(&error.to_string(), redact),
+        }),
+    }
+}
+
+fn github_pr_unavailable(status: &str, message: &str, redact: bool) -> Value {
+    json!({
+        "provider": "github",
+        "status": status,
+        "message": dashboard_error_message(message, redact),
+    })
+}
+
+fn dashboard_error_message(message: &str, redact: bool) -> String {
+    if redact {
+        "[redacted]".to_owned()
+    } else {
+        dashboard_text_cell(message)
+    }
+}
+
+fn ahead_behind_counts(project_dir: &Path) -> Result<(Value, Value), MosaicError> {
+    let counts = optional_git_stdout(
+        project_dir,
+        &["rev-list", "--left-right", "--count", "HEAD...@{u}"],
+    )?;
+    let Some(counts) = counts else {
+        return Ok((Value::Null, Value::Null));
+    };
+    let mut parts = counts.split_whitespace();
+    let ahead = parts
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Value::from)
+        .unwrap_or(Value::Null);
+    let behind = parts
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Value::from)
+        .unwrap_or(Value::Null);
+    Ok((ahead, behind))
+}
+
+fn optional_git_stdout(project_dir: &Path, args: &[&str]) -> Result<Option<String>, MosaicError> {
+    let output = run_git_command(project_dir, args)?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let stdout = output_stdout_trimmed(&output);
+    if stdout.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(stdout))
+    }
+}
+
+fn run_git_command(project_dir: &Path, args: &[&str]) -> Result<std::process::Output, MosaicError> {
+    let git_bin = env::var("MOSAIC_GIT_BIN").unwrap_or_else(|_| "git".to_owned());
+    let mut command = Command::new(git_bin);
+    command.arg("-C").arg(project_dir).args(args);
+    command_output_with_timeout(command, Duration::from_secs(3), "git_unavailable")
+}
+
+fn run_gh_command(project_dir: &Path, args: &[&str]) -> Result<std::process::Output, MosaicError> {
+    let gh_bin = env::var("MOSAIC_GH_BIN").unwrap_or_else(|_| "gh".to_owned());
+    let mut command = Command::new(gh_bin);
+    command.current_dir(project_dir).args(args);
+    command_output_with_timeout(command, Duration::from_secs(5), "gh_unavailable")
+}
+
+fn command_output_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+    spawn_error_code: &'static str,
+) -> Result<std::process::Output, MosaicError> {
+    let program = command.get_program().to_string_lossy().into_owned();
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|e| {
+        MosaicError::new(spawn_error_code, format!("failed to spawn {program}: {e}"))
+    })?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child.wait_with_output().map_err(|e| {
+                    MosaicError::new(
+                        "command_output_failed",
+                        format!("failed to collect output from {program}: {e}"),
+                    )
+                });
+            },
+            Ok(None) => {},
+            Err(error) => {
+                let _ = child.kill();
+                return Err(MosaicError::new(
+                    "command_wait_failed",
+                    format!("failed to poll {program}: {error}"),
+                ));
+            },
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait_with_output();
+            return Err(MosaicError::new(
+                "command_timeout",
+                format!("{program} timed out after {}ms", timeout.as_millis()),
+            ));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn output_stdout_trimmed(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+fn output_stderr(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stderr).trim().to_owned()
 }
 
 fn list_sessions_values() -> Result<Vec<Value>, MosaicError> {
@@ -2471,6 +2777,41 @@ fn write_dashboard_text(writer: &mut dyn Write, snapshot: &Value) -> io::Result<
             dashboard_text_cell(task.get("id").and_then(Value::as_str).unwrap_or("unknown")),
             dashboard_text_cell(
                 task.get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+            )
+        )?;
+    }
+    let project = &snapshot["project"];
+    writeln!(
+        writer,
+        "Project: {}",
+        dashboard_text_cell(
+            project
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+        )
+    )?;
+    if project.get("status").and_then(Value::as_str) == Some("captured") {
+        let git = &project["git"];
+        writeln!(
+            writer,
+            "  Branch: {}  Dirty: {}",
+            dashboard_text_cell(
+                git.get("branch")
+                    .and_then(Value::as_str)
+                    .unwrap_or("detached")
+            ),
+            git.get("dirty").and_then(Value::as_bool).unwrap_or(false)
+        )?;
+        let pull_request = &project["pull_request"];
+        writeln!(
+            writer,
+            "  PR: {}",
+            dashboard_text_cell(
+                pull_request
+                    .get("status")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown")
             )

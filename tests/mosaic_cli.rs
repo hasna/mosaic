@@ -1,5 +1,5 @@
 use serde_json::{json, Value};
-use std::{fs, process::Command, thread};
+use std::{fs, path::Path, process::Command, thread};
 use tempfile::tempdir;
 
 #[test]
@@ -86,6 +86,11 @@ fn mosaic_control_schema_covers_public_agent_events() {
             "missing schema definition {definition}"
         );
     }
+    assert!(schema["$defs"]["dashboardSnapshot"]["allOf"][1]["required"]
+        .as_array()
+        .expect("dashboard required fields")
+        .iter()
+        .any(|field| field.as_str() == Some("project")));
 
     let serialized = serde_json::to_string(&schema).expect("schema text");
     for event in [
@@ -106,6 +111,30 @@ fn mosaic_control_schema_covers_public_agent_events() {
     }
     assert!(!serialized.contains("/home/hasna"));
     assert!(!serialized.to_ascii_lowercase().contains("spark"));
+}
+
+fn init_git_repo(path: &Path) {
+    let init = Command::new("git")
+        .arg("init")
+        .arg(path)
+        .output()
+        .expect("git init should run");
+    assert!(
+        init.status.success(),
+        "git init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let checkout = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["checkout", "-B", "main"])
+        .output()
+        .expect("git checkout should run");
+    assert!(
+        checkout.status.success(),
+        "git checkout failed: {}",
+        String::from_utf8_lossy(&checkout.stderr)
+    );
 }
 
 #[test]
@@ -1868,6 +1897,118 @@ fn dashboard_prompt_bodies_require_explicit_opt_in_and_redact_wins() {
     assert!(!stdout.contains("show only when asked"));
     let dashboard: Value = serde_json::from_str(stdout.trim()).expect("dashboard json");
     assert_eq!(dashboard["queues"]["prompt_bodies"], "redacted");
+}
+
+#[test]
+fn dashboard_project_status_captures_local_git_state() {
+    let state_dir = tempdir().expect("state tempdir");
+    let config_dir = tempdir().expect("config tempdir");
+    let repo = tempdir().expect("repo tempdir");
+    init_git_repo(repo.path());
+    fs::write(repo.path().join("work.txt"), "dirty worktree").expect("write worktree file");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mosaic"))
+        .env("XDG_STATE_HOME", state_dir.path())
+        .env("XDG_CONFIG_HOME", config_dir.path())
+        .args([
+            "dashboard",
+            "--project-dir",
+            repo.path().to_str().expect("repo path"),
+        ])
+        .output()
+        .expect("dashboard");
+    assert!(output.status.success());
+
+    let dashboard: Value =
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).expect("dashboard");
+    assert_eq!(dashboard["project"]["status"], "captured");
+    assert_eq!(dashboard["project"]["git"]["available"], true);
+    assert_eq!(dashboard["project"]["git"]["branch"], "main");
+    assert_eq!(dashboard["project"]["git"]["dirty"], true);
+    assert_eq!(
+        dashboard["project"]["pull_request"]["status"],
+        "not_requested"
+    );
+}
+
+#[test]
+fn dashboard_project_status_handles_non_git_directory_without_failure() {
+    let state_dir = tempdir().expect("state tempdir");
+    let config_dir = tempdir().expect("config tempdir");
+    let project = tempdir().expect("project tempdir");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mosaic"))
+        .env("XDG_STATE_HOME", state_dir.path())
+        .env("XDG_CONFIG_HOME", config_dir.path())
+        .args([
+            "dashboard",
+            "--project-dir",
+            project.path().to_str().expect("project path"),
+        ])
+        .output()
+        .expect("dashboard");
+    assert!(output.status.success());
+
+    let dashboard: Value =
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).expect("dashboard");
+    assert_eq!(dashboard["project"]["status"], "not_git_repo");
+    assert_eq!(dashboard["project"]["git"]["available"], true);
+    assert_eq!(
+        dashboard["project"]["pull_request"]["status"],
+        "not_applicable"
+    );
+}
+
+#[test]
+fn dashboard_project_status_redacts_paths_and_tolerates_missing_gh() {
+    let state_dir = tempdir().expect("state tempdir");
+    let config_dir = tempdir().expect("config tempdir");
+    let repo = tempdir().expect("repo tempdir");
+    init_git_repo(repo.path());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mosaic"))
+        .env("XDG_STATE_HOME", state_dir.path())
+        .env("XDG_CONFIG_HOME", config_dir.path())
+        .env("MOSAIC_GH_BIN", repo.path().join("missing-gh"))
+        .args([
+            "dashboard",
+            "--project-dir",
+            repo.path().to_str().expect("repo path"),
+            "--github-pr",
+            "--redact",
+        ])
+        .output()
+        .expect("dashboard");
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains(repo.path().to_str().expect("repo path")));
+    let dashboard: Value = serde_json::from_str(stdout.trim()).expect("dashboard");
+    assert_eq!(dashboard["project"]["path"], "[redacted]");
+    assert_eq!(dashboard["project"]["git"]["repo_root"], "[redacted]");
+    assert_eq!(
+        dashboard["project"]["pull_request"]["status"],
+        "gh_unavailable"
+    );
+}
+
+#[test]
+fn dashboard_project_status_can_be_disabled() {
+    let state_dir = tempdir().expect("state tempdir");
+    let config_dir = tempdir().expect("config tempdir");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mosaic"))
+        .env("XDG_STATE_HOME", state_dir.path())
+        .env("XDG_CONFIG_HOME", config_dir.path())
+        .args(["dashboard", "--no-project-status"])
+        .output()
+        .expect("dashboard");
+    assert!(output.status.success());
+
+    let dashboard: Value =
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).expect("dashboard");
+    assert_eq!(dashboard["project"]["requested"], false);
+    assert_eq!(dashboard["project"]["status"], "not_requested");
 }
 
 #[test]
