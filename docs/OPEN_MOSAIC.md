@@ -19,6 +19,8 @@ Core requirements:
   and receipt ID, with redaction hooks for prompt bodies.
 - Goal/task context must use portable schemas and optional adapters; private
   task systems must not be required for core Mosaic control commands.
+- Web oversight must distinguish read-only watcher links from control links
+  and must not place raw authentication tokens in URLs.
 - Upstream sync must keep Zellij attribution and MIT notices intact.
 
 The first native surface is the `mosaic` binary, documented in
@@ -30,5 +32,6 @@ The first native surface is the `mosaic` binary, documented in
 `docs/DISPATCH_INTEGRATION.md`. Optional machine and transport registries are
 documented in `docs/MOSAIC_MACHINES.md`. Portable goal/task registries and the
 optional external todos adapter are documented in `docs/MOSAIC_GOALS.md`.
+Bookmarkable web oversight links are documented in `docs/MOSAIC_WEB.md`.
 Existing Zellij-derived crate and runtime names are implementation
 compatibility unless the relevant document says otherwise.

@@ -17,9 +17,128 @@ fn mosaic_help_exposes_agentic_control_surface() {
     assert!(stdout.contains("adapters"));
     assert!(stdout.contains("machines"));
     assert!(stdout.contains("goals"));
+    assert!(stdout.contains("web"));
     assert!(stdout.contains("observe"));
     assert!(stdout.contains("subscribe"));
     assert!(stdout.contains("dashboard"));
+}
+
+#[test]
+fn web_link_defaults_to_read_only_watch_url() {
+    let output = Command::new(env!("CARGO_BIN_EXE_mosaic"))
+        .args(["web", "link", "--session", "work"])
+        .output()
+        .expect("mosaic web link should run");
+    assert!(output.status.success());
+
+    let envelope: Value =
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).expect("web link");
+    assert_eq!(envelope["schema_version"], "mosaic.control.v1");
+    assert_eq!(envelope["event"], "web.link");
+    assert_eq!(envelope["web_schema_version"], "mosaic.web.v1");
+    assert_eq!(envelope["mode"], "watch");
+    assert_eq!(envelope["session"], "work");
+    assert_eq!(envelope["url"], "http://127.0.0.1:8082/work");
+    assert_eq!(envelope["bookmarkable"], true);
+    assert_eq!(envelope["read_only_required"], true);
+    assert_eq!(envelope["watcher"], true);
+    assert_eq!(envelope["control_allowed"], false);
+    assert_eq!(envelope["input_forwarding"], false);
+    assert_eq!(envelope["can_create_sessions"], false);
+    assert_eq!(envelope["auth"]["link_contains_token"], false);
+    assert_eq!(envelope["auth"]["recommended_token_type"], "read_only");
+    assert_eq!(envelope["security"]["raw_tokens_in_urls"], "unsupported");
+}
+
+#[test]
+fn web_link_control_mode_preserves_base_path() {
+    let output = Command::new(env!("CARGO_BIN_EXE_mosaic"))
+        .args([
+            "web",
+            "link",
+            "--session",
+            "agent-work",
+            "--base-url",
+            "https://mosaic.example.test/base/",
+            "--mode",
+            "control",
+            "--token-name",
+            "operator",
+        ])
+        .output()
+        .expect("mosaic web link should run");
+    assert!(output.status.success());
+
+    let envelope: Value =
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).expect("web link");
+    assert_eq!(envelope["mode"], "control");
+    assert_eq!(
+        envelope["url"],
+        "https://mosaic.example.test/base/agent-work"
+    );
+    assert_eq!(envelope["routes"]["session"], "/base/agent-work");
+    assert_eq!(envelope["routes"]["client_session"], "/base/session");
+    assert_eq!(envelope["routes"]["control_websocket"], "/base/ws/control");
+    assert_eq!(envelope["read_only_required"], false);
+    assert_eq!(envelope["watcher"], false);
+    assert_eq!(envelope["control_allowed"], true);
+    assert_eq!(envelope["input_forwarding"], true);
+    assert_eq!(envelope["can_create_sessions"], true);
+    assert_eq!(envelope["auth"]["recommended_token_type"], "control");
+    assert_eq!(envelope["auth"]["token_name"], "operator");
+}
+
+#[test]
+fn web_link_rejects_unsafe_base_urls() {
+    for base_url in [
+        "file:///tmp/mosaic",
+        "http://user:secret@example.test",
+        "https://example.test/?token=secret",
+        "https://example.test/#secret",
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_mosaic"))
+            .args(["web", "link", "--session", "work", "--base-url", base_url])
+            .output()
+            .expect("mosaic web link should run");
+        assert!(!output.status.success(), "{base_url} should be rejected");
+        assert!(output.stdout.is_empty());
+        let error: Value =
+            serde_json::from_str(String::from_utf8_lossy(&output.stderr).trim()).expect("error");
+        assert_eq!(error["code"], "invalid_web_base_url");
+    }
+}
+
+#[test]
+fn web_link_redaction_hides_session_url_and_token_label() {
+    let output = Command::new(env!("CARGO_BIN_EXE_mosaic"))
+        .args([
+            "web",
+            "link",
+            "--session",
+            "private-work",
+            "--base-url",
+            "https://private.example.test/base/",
+            "--token-name",
+            "private-token",
+            "--redact",
+        ])
+        .output()
+        .expect("mosaic web link should run");
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("private-work"));
+    assert!(!stdout.contains("private.example.test"));
+    assert!(!stdout.contains("private-token"));
+    let envelope: Value = serde_json::from_str(stdout.trim()).expect("web link");
+    assert_eq!(envelope["session"], "[redacted]");
+    assert_eq!(envelope["base_url"], "[redacted]");
+    assert_eq!(envelope["url"], "[redacted]");
+    assert_eq!(envelope["routes"]["session"], "[redacted]");
+    assert_eq!(envelope["routes"]["client_session"], "[redacted]");
+    assert_eq!(envelope["routes"]["control_websocket"], "[redacted]");
+    assert_eq!(envelope["auth"]["token_name"], "[redacted]");
+    assert_eq!(envelope["auth"]["link_contains_token"], false);
 }
 
 #[test]

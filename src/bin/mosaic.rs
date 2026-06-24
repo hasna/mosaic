@@ -22,7 +22,7 @@ use zellij_utils::{
     data::{ClientId, PaneId},
     input::actions::Action,
     ipc::{ClientToServerMsg, ExitReason, IpcSenderWithContext, ServerToClientMsg},
-    sessions::{get_active_session, get_sessions, ActiveSession},
+    sessions::{get_active_session, get_sessions, validate_session_name, ActiveSession},
 };
 
 #[path = "mosaic/adapters.rs"]
@@ -35,6 +35,8 @@ mod mosaic_goals;
 mod mosaic_machines;
 
 const SCHEMA_VERSION: &str = "mosaic.control.v1";
+const WEB_SCHEMA_VERSION: &str = "mosaic.web.v1";
+const DEFAULT_WEB_BASE_URL: &str = "http://127.0.0.1:8082";
 
 #[derive(Parser, Debug)]
 #[clap(
@@ -111,6 +113,11 @@ enum MosaicCommand {
     Goals {
         #[clap(subcommand)]
         command: GoalsCommand,
+    },
+    /// Create safe web oversight links for watch/control workflows.
+    Web {
+        #[clap(subcommand)]
+        command: WebCommand,
     },
     /// Capture structured pane observations.
     Observe {
@@ -264,6 +271,12 @@ enum GoalsCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum WebCommand {
+    /// Build a bookmarkable session URL with explicit watch/control metadata.
+    Link(WebLinkArgs),
+}
+
+#[derive(Subcommand, Debug)]
 enum ObserveCommand {
     /// Capture a structured snapshot of one pane.
     Pane(ObservePaneArgs),
@@ -361,6 +374,25 @@ struct GoalsTodosPlanArgs {
     #[clap(long, default_value = "10")]
     limit: usize,
     /// Redact task titles, descriptions, links, and local paths in output.
+    #[clap(long)]
+    redact: bool,
+}
+
+#[derive(Parser, Debug)]
+struct WebLinkArgs {
+    /// Session name to open in the browser.
+    #[clap(long)]
+    session: String,
+    /// Base URL of the running Open Mosaic/Zellij-compatible web server.
+    #[clap(long, default_value = DEFAULT_WEB_BASE_URL)]
+    base_url: String,
+    /// Link capability mode.
+    #[clap(long, arg_enum, default_value = "watch")]
+    mode: WebMode,
+    /// Optional token label for operator context. Raw tokens are never accepted here.
+    #[clap(long)]
+    token_name: Option<String>,
+    /// Redact session, URL, base URL, route path, and token label in output.
     #[clap(long)]
     redact: bool,
 }
@@ -477,6 +509,35 @@ enum StreamFormat {
 enum DashboardFormat {
     Json,
     Text,
+}
+
+#[derive(Clone, Copy, Debug, ArgEnum)]
+enum WebMode {
+    Watch,
+    Control,
+}
+
+impl WebMode {
+    fn as_str(&self) -> &'static str {
+        match self {
+            WebMode::Watch => "watch",
+            WebMode::Control => "control",
+        }
+    }
+
+    fn recommended_token_type(&self) -> &'static str {
+        match self {
+            WebMode::Watch => "read_only",
+            WebMode::Control => "control",
+        }
+    }
+
+    fn create_token_command(&self) -> &'static str {
+        match self {
+            WebMode::Watch => "zellij web --create-read-only-token <name>",
+            WebMode::Control => "zellij web --create-token <name>",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -638,6 +699,7 @@ fn run(cli: MosaicCli) -> Result<u8, MosaicError> {
         MosaicCommand::Adapters { command } => run_adapters(command),
         MosaicCommand::Machines { command } => run_machines(command, cli.dry_run),
         MosaicCommand::Goals { command } => run_goals(command, cli.dry_run),
+        MosaicCommand::Web { command } => run_web(command, cli.dry_run),
         MosaicCommand::Observe { command } => {
             let session = resolve_session(cli.session)?;
             run_observe(&session, command)
@@ -663,6 +725,152 @@ fn run(cli: MosaicCli) -> Result<u8, MosaicError> {
             run_subscribe(&session, args)
         },
         MosaicCommand::Dashboard(args) => run_dashboard(cli.session, args),
+    }
+}
+
+fn run_web(command: WebCommand, dry_run: bool) -> Result<u8, MosaicError> {
+    match command {
+        WebCommand::Link(args) => {
+            print_value(web_link_event(args, dry_run)?)?;
+            Ok(0)
+        },
+    }
+}
+
+fn web_link_event(args: WebLinkArgs, dry_run: bool) -> Result<Value, MosaicError> {
+    validate_session_name(&args.session).map_err(|e| MosaicError::new("invalid_web_session", e))?;
+    let base_url = parse_web_base_url(&args.base_url)?;
+    let link_url = web_session_url(base_url.clone(), &args.session)?;
+    let route_path = link_url.path().to_owned();
+    let mode = args.mode;
+    let is_watch = matches!(mode, WebMode::Watch);
+    let timestamp_ms = now_millis();
+    let status = if dry_run { "dry_run" } else { "computed" };
+    let token_name = args
+        .token_name
+        .as_deref()
+        .map(|value| redact_web_value(value, args.redact));
+
+    Ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "event": "web.link",
+        "web_schema_version": WEB_SCHEMA_VERSION,
+        "id": format!("mosaic-web-{}-{timestamp_ms}", std::process::id()),
+        "operation": "web.link",
+        "status": status,
+        "ack": "local_only",
+        "timestamp_ms": timestamp_ms,
+        "server_scope": "local_web_server",
+        "mode": mode.as_str(),
+        "session": redact_web_value(&args.session, args.redact),
+        "base_url": redact_web_value(base_url.as_str(), args.redact),
+        "url": redact_web_value(link_url.as_str(), args.redact),
+        "bookmarkable": true,
+        "read_only_required": is_watch,
+        "watcher": is_watch,
+        "control_allowed": !is_watch,
+        "input_forwarding": !is_watch,
+        "can_create_sessions": !is_watch,
+        "web_sharing_required": true,
+        "routes": {
+            "session": redact_web_value(&route_path, args.redact),
+            "assets": redact_web_value(&web_route_template(&base_url, "/assets/{path}"), args.redact),
+            "login": redact_web_value(&web_route_template(&base_url, "/command/login"), args.redact),
+            "client_session": redact_web_value(&web_route_template(&base_url, "/session"), args.redact),
+            "terminal_websocket": redact_web_value(&web_route_template(&base_url, "/ws/terminal"), args.redact),
+            "control_websocket": redact_web_value(&web_route_template(&base_url, "/ws/control"), args.redact),
+        },
+        "auth": {
+            "requires_login_cookie": true,
+            "link_contains_token": false,
+            "token_delivery": "out_of_band",
+            "recommended_token_type": mode.recommended_token_type(),
+            "token_name": token_name,
+            "create_token_command": mode.create_token_command(),
+        },
+        "security": {
+            "secure_default": is_watch,
+            "accepted_schemes": ["http", "https"],
+            "localhost_recommended": true,
+            "raw_tokens_in_urls": "unsupported",
+            "watch_mode_uses_watcher_client": true,
+            "watch_mode_rejects_new_session_creation": true,
+            "control_mode_requires_non_read_only_token": true,
+            "credentials_in_base_url": "rejected",
+            "query_or_fragment_in_base_url": "rejected",
+        },
+    }))
+}
+
+fn parse_web_base_url(base_url: &str) -> Result<url::Url, MosaicError> {
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
+        return Err(MosaicError::new(
+            "invalid_web_base_url",
+            "web base URL cannot be empty",
+        ));
+    }
+    let url = url::Url::parse(trimmed).map_err(|e| {
+        MosaicError::new(
+            "invalid_web_base_url",
+            format!("failed to parse base URL: {e}"),
+        )
+    })?;
+    match url.scheme() {
+        "http" | "https" => {},
+        scheme => {
+            return Err(MosaicError::new(
+                "invalid_web_base_url",
+                format!("web base URL must use http or https, got {scheme:?}"),
+            ));
+        },
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(MosaicError::new(
+            "invalid_web_base_url",
+            "web base URL must not include credentials",
+        ));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(MosaicError::new(
+            "invalid_web_base_url",
+            "web base URL must not include a query string or fragment",
+        ));
+    }
+    Ok(url)
+}
+
+fn web_session_url(mut base_url: url::Url, session: &str) -> Result<url::Url, MosaicError> {
+    if base_url.path() != "/" && base_url.path().ends_with('/') {
+        let trimmed_path = base_url.path().trim_end_matches('/').to_owned();
+        base_url.set_path(&trimmed_path);
+    }
+    {
+        let mut segments = base_url.path_segments_mut().map_err(|_| {
+            MosaicError::new(
+                "invalid_web_base_url",
+                "web base URL cannot be used as a session-route base",
+            )
+        })?;
+        segments.push(session);
+    }
+    Ok(base_url)
+}
+
+fn web_route_template(base_url: &url::Url, suffix: &str) -> String {
+    let prefix = base_url.path().trim_end_matches('/');
+    if prefix.is_empty() {
+        suffix.to_owned()
+    } else {
+        format!("{prefix}{suffix}")
+    }
+}
+
+fn redact_web_value(value: &str, redact: bool) -> String {
+    if redact {
+        "[redacted]".to_owned()
+    } else {
+        value.to_owned()
     }
 }
 
